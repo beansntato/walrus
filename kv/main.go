@@ -23,11 +23,12 @@ type KV struct {
 
 func main() {
 	wal := wal.New()
+	kv := &KV{data: make(map[string]string), wal: wal}
+	wal.Recover(kv)
+
 	go wal.Start()
 
-	kv := &KV{data: make(map[string]string), wal: wal}
-
-	kv.Put("a", "1")
+	// kv.Put("b", "2")
 	kv.print()
 }
 

@@ -1,16 +1,18 @@
 package wal
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 )
 
 type StateMachine interface {
-	apply()
-	snapshot()
-	restore()
+	Apply(record Record) error
+	Snapshot()
+	Restore()
 }
 
 type WAL struct {
@@ -83,6 +85,41 @@ func (w *WAL) Append(record Record) error {
 	return <-done
 }
 
-func Restore() {
+func (w *WAL) Recover(sm StateMachine) error {
+	f, err := os.Open("example.txt")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 
+	var records []Record
+
+	scanner := bufio.NewScanner(f)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		parts := strings.SplitN(line, " ", 2)
+
+		method := parts[0]
+
+		keyValue := strings.SplitN(parts[1], ":", 2)
+
+		record := Record{
+			Key:    keyValue[0],
+			Value:  keyValue[1],
+			Method: method,
+		}
+
+		records = append(records, record)
+	}
+
+	for _, record := range records {
+		err := sm.Apply(record)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
