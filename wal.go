@@ -3,10 +3,9 @@ package wal
 import (
 	"bufio"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
-	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -38,20 +37,34 @@ func New() *WAL {
 
 func getEpoch(root string, ext string) ([]string, error) {
 	var files []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if d.IsDir() {
-			return nil
-		}
 
+	f, err := os.Open(".")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+
+	// Read all names (-1 means all)
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Print the names
+	for _, name := range names {
+		fmt.Println(name)
+	}
+
+	for _, path := range names {
 		if strings.HasPrefix(path, "wal-") && strings.HasSuffix(path, "."+ext) {
 			files = append(files, path)
-			return nil
 		}
+	}
 
-		return nil
-	})
+	slices.SortFunc(files, naturalCmp)
 
-	return files, err
+	fmt.Println("files", files)
+	return files, nil
 }
 
 func (w *WAL) Start() {
