@@ -10,10 +10,12 @@ type methodType int
 
 const (
 	PUT methodType = iota
+	DELETE
 )
 
 var methodName = map[methodType]string{
-	PUT: "PUT",
+	PUT:    "PUT",
+	DELETE: "DELETE",
 }
 
 type KV struct {
@@ -28,7 +30,9 @@ func main() {
 
 	go wal.Start()
 
-	// kv.Put("b", "2")
+	kv.Put("b", "2")
+	kv.Delete("b")
+	kv.Put("a", "2")
 	kv.print()
 }
 
@@ -57,10 +61,26 @@ func (kv *KV) Put(key, value string) error {
 	return nil
 }
 
+func (kv *KV) Delete(key string) error {
+	record := wal.Record{
+		Key:    key,
+		Method: methodName[DELETE],
+	}
+
+	err := kv.wal.Append(record)
+	if err != nil {
+		return err
+	}
+
+	return kv.Apply(record)
+}
+
 func (kv *KV) Apply(record wal.Record) error {
 	switch record.Method {
 	case "PUT":
 		kv.data[record.Key] = record.Value
+	case "DELETE":
+		delete(kv.data, record.Key)
 	default:
 		fmt.Println("Working in progress on this method bruh")
 	}
