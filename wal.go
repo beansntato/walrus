@@ -3,8 +3,10 @@ package wal
 import (
 	"bufio"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -34,13 +36,50 @@ func New() *WAL {
 	return &WAL{writeCh: make(chan Request)}
 }
 
-func (w *WAL) Start() {
+func getEpoch(root string, ext string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if d.IsDir() {
+			return nil
+		}
 
-	f, err := os.OpenFile("example.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if strings.HasPrefix(path, "wal-") && strings.HasSuffix(path, "."+ext) {
+			files = append(files, path)
+			return nil
+		}
+
+		return nil
+	})
+
+	return files, err
+}
+
+func (w *WAL) Start() {
+	// get length of files and create wal-{n + 1}.log, edge-case for 10, 11
+	epoch, err := getEpoch(".", "log")
+
 	if err != nil {
-		log.Fatal(err)
+		return
 	}
-	defer f.Close()
+
+	var currentFile *os.File
+	epochLen := len(epoch)
+
+	// create starting wal file or open file
+	if len(epoch) == 0 {
+		currentFile, err = os.Create(fmt.Sprintf("wal-%d.log", len(epoch)+1))
+		if err != nil {
+			fmt.Printf("unable to create starting file: %v", err)
+		}
+		// add 1 to epochLen - getEpoch only runs on start up
+		epochLen++
+	} else {
+		currentFile, err = os.OpenFile(epoch[len(epoch)-1], os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	defer currentFile.Close()
 
 	var pending []Request
 	var buffer []byte
@@ -52,13 +91,13 @@ func (w *WAL) Start() {
 			pending = append(pending, data)
 			buffer = append(buffer, []byte(fmt.Sprintf("%s %s:%s\n", data.Record.Method, data.Record.Key, data.Record.Value))...)
 		case <-ticker.C:
+			// checkpoint every 5ms - make sure to not recover records on database already
 			if len(buffer) == 0 {
 				continue
 			}
 
-			_, err := f.Write(buffer)
-
-			f.Sync()
+			_, err := currentFile.Write(buffer)
+			currentFile.Sync()
 
 			// notify the waiters
 			for _, req := range pending {
@@ -67,6 +106,7 @@ func (w *WAL) Start() {
 
 			pending = pending[:0]
 			buffer = buffer[:0]
+
 		}
 	}
 
@@ -86,19 +126,35 @@ func (w *WAL) Append(record Record) error {
 }
 
 func (w *WAL) Recover(sm StateMachine) error {
-	f, err := os.Open("example.txt")
+	epoch, err := getEpoch(".", "log")
+
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+
+	var currentFile *os.File
+
+	// create starting wal file or open file
+	if len(epoch) == 0 {
+		// stop recover since no wal files yet
+		return nil
+	}
+
+	currentFile, err = os.Open(epoch[len(epoch)-1])
+	fmt.Println(epoch[len(epoch)-1])
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer currentFile.Close()
+
+	fmt.Println(currentFile)
 
 	var records []Record
 
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(currentFile)
 
 	for scanner.Scan() {
 		line := scanner.Text()
-
 		parts := strings.SplitN(line, " ", 2)
 
 		method := parts[0]
