@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zeebo/xxh3"
+	"github.com/cespare/xxhash"
 )
 
 type StateMachine interface {
@@ -101,7 +101,7 @@ func buildHeader(epoch uint32, seq uint32, headerType byte, payload []byte) []by
 	binary.LittleEndian.PutUint16(h[9:11], uint16(len(payload)))
 
 	// checksum
-	checksum := xxh3.Hash(append(h[:11], payload...))
+	checksum := xxhash.Sum64(append(h[:11], payload...))
 	binary.LittleEndian.PutUint64(h[11:HEADER_SIZE], checksum)
 	return h
 }
@@ -236,7 +236,7 @@ func (w *WAL) Recover(sm StateMachine) error {
 		}
 
 		// compare and verify the checksum
-		computedChecksum := xxh3.Hash(append(headerBuf[:11], payload...))
+		computedChecksum := xxhash.Sum64(append(headerBuf[:11], payload...))
 		if computedChecksum != storedChecksum {
 			break
 		}
