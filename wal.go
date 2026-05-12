@@ -1,9 +1,9 @@
 package wal
 
 import (
-	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"slices"
@@ -49,7 +49,7 @@ func New() *WAL {
 func getEpoch(root string, ext string) ([]string, error) {
 	var files []string
 
-	f, err := os.Open(".")
+	f, err := os.Open(root)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -145,8 +145,8 @@ func (w *WAL) Start() {
 			pending = append(pending, data)
 			// [epoch][sequence][type][length][XXH3 checksum][payload]
 			payload := []byte(fmt.Sprintf("%s %s:%s\n", data.Record.Method, data.Record.Key, data.Record.Value))
-			header := buildHeader(w.epoch, w.seq, TypeWrite, payload)
 			w.seq++
+			header := buildHeader(w.epoch, w.seq, TypeWrite, payload)
 			buffer = append(buffer, header...)
 			buffer = append(buffer, payload...)
 		case <-ticker.C:
@@ -192,16 +192,15 @@ func (w *WAL) Recover(sm StateMachine) error {
 		return err
 	}
 
-	var currentFile *os.File
-
 	// create starting wal file or open file
 	if len(epoch) == 0 {
 		// stop recover since no wal files yet
 		return nil
 	}
 
-	currentFile, err = os.Open(epoch[len(epoch)-1])
+	currentFile, err := os.Open(epoch[len(epoch)-1])
 	fmt.Println(epoch[len(epoch)-1])
+
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -211,11 +210,48 @@ func (w *WAL) Recover(sm StateMachine) error {
 
 	var records []Record
 
-	scanner := bufio.NewScanner(currentFile)
+	var expectedSeq uint32 = 1
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.SplitN(line, " ", 2)
+	for {
+		headerBuf := make([]byte, HEADER_SIZE)
+		_, err := io.ReadFull(currentFile, headerBuf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// corrupted header
+			break
+		}
+		seq := binary.LittleEndian.Uint32(headerBuf[4:8])
+		recType := headerBuf[8]
+		length := binary.LittleEndian.Uint16(headerBuf[9:11])
+		storedChecksum := binary.LittleEndian.Uint64(headerBuf[11:HEADER_SIZE])
+
+		payload := make([]byte, length)
+		_, err = io.ReadFull(currentFile, payload)
+
+		if err != nil {
+			// corrupted payload
+			break
+		}
+
+		// compare and verify the checksum
+		computedChecksum := xxh3.Hash(append(headerBuf[:11], payload...))
+		if computedChecksum != storedChecksum {
+			break
+		}
+
+		if seq != expectedSeq {
+			break
+		}
+		expectedSeq++
+
+		// only apply write records
+		if recType != TypeWrite {
+			continue
+		}
+
+		parts := strings.SplitN(string(payload), " ", 2)
 
 		method := parts[0]
 
@@ -226,16 +262,17 @@ func (w *WAL) Recover(sm StateMachine) error {
 			Value:  keyValue[1],
 			Method: method,
 		}
+		fmt.Printf("epoch=%d seq=%d type=%d checksum_ok=%v payload=%q\n",
+			epoch, seq, recType, computedChecksum == storedChecksum, payload)
 
 		records = append(records, record)
-	}
 
-	for _, record := range records {
-		err := sm.Apply(record)
+		err = sm.Apply(record)
 		if err != nil {
 			return err
 		}
 	}
 
+	w.seq = expectedSeq - 1
 	return nil
 }
