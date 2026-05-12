@@ -39,7 +39,6 @@ type Record struct {
 const (
 	TypeWrite byte = iota + 1
 	TypeCheckpoint
-	TypeTombstone
 )
 
 func New() *WAL {
@@ -144,8 +143,9 @@ func (w *WAL) Start() {
 		case data := <-w.writeCh:
 			pending = append(pending, data)
 			// [epoch][sequence][type][length][XXH3 checksum][payload]
-			payload := []byte(fmt.Sprintf("%s %s:%s\n", data.Record.Method, data.Record.Key, data.Record.Value))
+			payload := []byte(fmt.Sprintf("%s %s:%s", data.Record.Method, data.Record.Key, data.Record.Value))
 			w.seq++
+
 			header := buildHeader(w.epoch, w.seq, TypeWrite, payload)
 			buffer = append(buffer, header...)
 			buffer = append(buffer, payload...)
@@ -259,11 +259,11 @@ func (w *WAL) Recover(sm StateMachine) error {
 
 		record := Record{
 			Key:    keyValue[0],
-			Value:  keyValue[1],
 			Method: method,
 		}
-		fmt.Printf("epoch=%d seq=%d type=%d checksum_ok=%v payload=%q\n",
-			epoch, seq, recType, computedChecksum == storedChecksum, payload)
+		if len(keyValue) > 1 {
+			record.Value = keyValue[1]
+		}
 
 		records = append(records, record)
 
