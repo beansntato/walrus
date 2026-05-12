@@ -2,12 +2,15 @@ package wal
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"os"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/zeebo/xxh3"
 )
 
 type StateMachine interface {
@@ -18,6 +21,8 @@ type StateMachine interface {
 
 type WAL struct {
 	writeCh chan Request
+	seq     uint32
+	epoch   uint32
 }
 
 type Request struct {
@@ -31,8 +36,14 @@ type Record struct {
 	Method string
 }
 
+const (
+	TypeWrite byte = iota + 1
+	TypeCheckpoint
+	TypeTombstone
+)
+
 func New() *WAL {
-	return &WAL{writeCh: make(chan Request)}
+	return &WAL{writeCh: make(chan Request), epoch: 0, seq: 0}
 }
 
 func getEpoch(root string, ext string) ([]string, error) {
@@ -63,13 +74,43 @@ func getEpoch(root string, ext string) ([]string, error) {
 
 	slices.SortFunc(files, naturalCmp)
 
-	fmt.Println("files", files)
 	return files, nil
+}
+
+func (w *WAL) checkpoint() {
+	// check if WAL has 1000 lines -> Recover()
+
+	// // initialize the new wal file wal-{n}.log - n = no. of files with wal- prefix and .log extension
+	// currentFile, err = os.Create(fmt.Sprintf("wal-%d.log", epochLen+1))
+	// if err != nil {
+	// 	fmt.Printf("unable to create starting file: %w", err)
+	// }
+	// epochLen++
+}
+
+const HEADER_SIZE = 4 + // epoch
+	4 + // seq
+	1 + // type
+	2 + // length
+	8 // xxh3 checksum
+
+func buildHeader(epoch uint32, seq uint32, headerType byte, payload []byte) []byte {
+	h := make([]byte, HEADER_SIZE)
+	binary.LittleEndian.PutUint32(h[0:4], epoch)
+	binary.LittleEndian.PutUint32(h[4:8], seq)
+	h[8] = headerType
+	binary.LittleEndian.PutUint16(h[9:11], uint16(len(payload)))
+
+	// checksum
+	checksum := xxh3.Hash(append(h[:11], payload...))
+	binary.LittleEndian.PutUint64(h[11:HEADER_SIZE], checksum)
+	return h
 }
 
 func (w *WAL) Start() {
 	// get length of files and create wal-{n + 1}.log, edge-case for 10, 11
 	epoch, err := getEpoch(".", "log")
+	w.epoch = uint32(len(epoch))
 
 	if err != nil {
 		return
@@ -102,7 +143,12 @@ func (w *WAL) Start() {
 		select {
 		case data := <-w.writeCh:
 			pending = append(pending, data)
-			buffer = append(buffer, []byte(fmt.Sprintf("%s %s:%s\n", data.Record.Method, data.Record.Key, data.Record.Value))...)
+			// [epoch][sequence][type][length][XXH3 checksum][payload]
+			payload := []byte(fmt.Sprintf("%s %s:%s\n", data.Record.Method, data.Record.Key, data.Record.Value))
+			header := buildHeader(w.epoch, w.seq, TypeWrite, payload)
+			w.seq++
+			buffer = append(buffer, header...)
+			buffer = append(buffer, payload...)
 		case <-ticker.C:
 			// checkpoint every 5ms - make sure to not recover records on database already
 			if len(buffer) == 0 {
@@ -140,6 +186,7 @@ func (w *WAL) Append(record Record) error {
 
 func (w *WAL) Recover(sm StateMachine) error {
 	epoch, err := getEpoch(".", "log")
+	w.epoch = uint32(len(epoch))
 
 	if err != nil {
 		return err
