@@ -2,9 +2,14 @@ package wal
 
 import (
 	"cmp"
+	"fmt"
 	"strconv"
 	"strings"
 )
+
+func getSegmentPath(epoch uint32) string {
+	return fmt.Sprintf("wal-%06d.log", epoch)
+}
 
 func naturalCmp(a, b string) int {
 	// tokenizer solution for natural sort lol

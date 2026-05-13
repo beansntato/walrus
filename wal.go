@@ -15,15 +15,16 @@ import (
 
 type StateMachine interface {
 	Apply(record Record) error
-	Snapshot()
-	Restore()
+	Snapshot() []byte
+	Restore([]byte) error
 }
 
 type WAL struct {
-	writeCh   chan Request
-	seq       uint32
-	epoch     uint32
-	globalSeq uint64
+	writeCh     chan Request
+	seq         uint32
+	epoch       uint32
+	globalSeq   uint64
+	currentFile *os.File
 }
 
 type Request struct {
@@ -77,6 +78,35 @@ func getEpoch(root string, ext string) ([]string, error) {
 	return files, nil
 }
 
+const MAX_SEGMENT_SIZE = 64 * 1024 * 1024 // 64MB
+
+// once the current wal file size exceeds the max size, create the next file TODO: add by line check, if exceeds 1M lines
+func (w *WAL) rotate() error {
+	info, err := w.currentFile.Stat()
+	if err != nil {
+		return err
+	}
+
+	if info.Size() < MAX_SEGMENT_SIZE {
+		return nil
+	}
+
+	if err := w.currentFile.Sync(); err != nil {
+		return err
+	}
+	w.currentFile.Close()
+
+	w.epoch++
+	w.seq = 0
+	next := getSegmentPath(w.epoch)
+	f, err := os.OpenFile(next, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	w.currentFile = f
+	return nil
+}
+
 func (w *WAL) checkpoint() {
 	// check if WAL has 1000 lines -> Recover()
 
@@ -123,7 +153,7 @@ func (w *WAL) Start() {
 
 	// create starting wal file or open file
 	if len(epoch) == 0 {
-		currentFile, err = os.Create(fmt.Sprintf("wal-%d.log", len(epoch)+1))
+		currentFile, err = os.Create(getSegmentPath(uint32(len(epoch) + 1)))
 		if err != nil {
 			fmt.Printf("unable to create starting file: %v", err)
 		}
@@ -141,6 +171,8 @@ func (w *WAL) Start() {
 	var buffer []byte
 	ticker := time.NewTicker(5 * time.Millisecond)
 
+	w.currentFile = currentFile
+
 	for {
 		select {
 		case data := <-w.writeCh:
@@ -149,12 +181,23 @@ func (w *WAL) Start() {
 			payload := []byte(fmt.Sprintf("%s %s:%s", data.Record.Method, data.Record.Key, data.Record.Value))
 			w.seq++
 
-			header := buildHeader(w.epoch, w.seq, TypeWrite, payload)
+			header := buildHeader(w.epoch, w.seq, w.globalSeq, TypeWrite, payload)
 			buffer = append(buffer, header...)
 			buffer = append(buffer, payload...)
 		case <-ticker.C:
 			// checkpoint every 5ms - make sure to not recover records on database already
 			if len(buffer) == 0 {
+				continue
+			}
+
+			// if file size exceeds limit, rotate the wal
+			if err := w.rotate(); err != nil {
+				for _, req := range pending {
+					req.Done <- err
+				}
+
+				pending = pending[:0]
+				buffer = buffer[:0]
 				continue
 			}
 
