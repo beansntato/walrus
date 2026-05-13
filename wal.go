@@ -20,9 +20,10 @@ type StateMachine interface {
 }
 
 type WAL struct {
-	writeCh chan Request
-	seq     uint32
-	epoch   uint32
+	writeCh   chan Request
+	seq       uint32
+	epoch     uint32
+	globalSeq uint64
 }
 
 type Request struct {
@@ -88,21 +89,23 @@ func (w *WAL) checkpoint() {
 }
 
 const HEADER_SIZE = 4 + // epoch
-	4 + // seq
+	4 + // local seq
+	8 + // global seq
 	1 + // type
-	2 + // length
+	4 + // length
 	8 // xxh3 checksum
 
-func buildHeader(epoch uint32, seq uint32, headerType byte, payload []byte) []byte {
+func buildHeader(epoch uint32, seq uint32, globalSeq uint64, recType byte, payload []byte) []byte {
 	h := make([]byte, HEADER_SIZE)
 	binary.LittleEndian.PutUint32(h[0:4], epoch)
 	binary.LittleEndian.PutUint32(h[4:8], seq)
-	h[8] = headerType
-	binary.LittleEndian.PutUint16(h[9:11], uint16(len(payload)))
+	binary.LittleEndian.PutUint64(h[8:16], globalSeq)
+	h[16] = recType
+	binary.LittleEndian.PutUint32(h[17:21], uint32(len(payload)))
 
 	// checksum
-	checksum := xxhash.Sum64(append(h[:11], payload...))
-	binary.LittleEndian.PutUint64(h[11:HEADER_SIZE], checksum)
+	checksum := xxhash.Sum64(append(h[:21], payload...))
+	binary.LittleEndian.PutUint64(h[21:29], checksum)
 	return h
 }
 
