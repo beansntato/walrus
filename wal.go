@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"slices"
 	"strings"
@@ -20,10 +19,11 @@ type StateMachine interface {
 }
 
 type WAL struct {
-	writeCh     chan Request
-	seq         uint32
-	epoch       uint32
-	currentFile *os.File
+	writeCh       chan Request
+	seq           uint32
+	epoch         uint32
+	currentFile   *os.File
+	snapshotCount uint32
 }
 
 type Request struct {
@@ -42,8 +42,11 @@ const (
 	TypeCheckpoint
 )
 
-const MAX_SEGMENT_SIZE = 64 * 1024 * 1024 // 64MB
-
+const (
+	MAX_SEGMENT_SIZE = 64 * 1024 * 1024 // 64MB
+	SNAPSHOT_COUNT   = 100_000
+	SNAPSHOTS_DIR    = "snapshot"
+)
 const HEADER_SIZE = 4 + // epoch
 	4 + // local seq
 	1 + // type
@@ -51,37 +54,37 @@ const HEADER_SIZE = 4 + // epoch
 	8 // xxh3 checksum
 
 func New() *WAL {
-	return &WAL{writeCh: make(chan Request), epoch: 0, seq: 0}
+	return &WAL{writeCh: make(chan Request, 1), snapshotCount: SNAPSHOT_COUNT}
 }
 
-func getSegments(root string, ext string) ([]string, error) {
+func NewWithOptions(snapshotCount uint32) *WAL {
+	return &WAL{
+		writeCh:       make(chan Request, 1),
+		snapshotCount: snapshotCount,
+	}
+}
+
+func getSegments(root string) ([]string, error) {
 	var files []string
 
 	f, err := os.Open(root)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("open dir %q: %w", root, err)
 	}
 	defer f.Close()
 
-	// Read all names (-1 means all)
 	names, err := f.Readdirnames(-1)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("readdirnames %q: %w", root, err)
 	}
 
-	// Print the names
 	for _, name := range names {
-		fmt.Println(name)
-	}
-
-	for _, path := range names {
-		if strings.HasPrefix(path, "wal-") && strings.HasSuffix(path, "."+ext) {
-			files = append(files, path)
+		if strings.HasPrefix(name, "wal-") && strings.HasSuffix(name, ".log") {
+			files = append(files, name)
 		}
 	}
 
 	slices.SortFunc(files, naturalCmp)
-
 	return files, nil
 }
 
@@ -90,7 +93,7 @@ func getSegments(root string, ext string) ([]string, error) {
 func (w *WAL) rotate() error {
 	info, err := w.currentFile.Stat()
 	if err != nil {
-		return err
+		return fmt.Errorf("rotate stat: %w", err)
 	}
 
 	if info.Size() < MAX_SEGMENT_SIZE {
@@ -98,16 +101,17 @@ func (w *WAL) rotate() error {
 	}
 
 	if err := w.currentFile.Sync(); err != nil {
-		return err
+		return fmt.Errorf("rotate sync: %w", err)
 	}
-	w.currentFile.Close()
+	if err := w.currentFile.Close(); err != nil {
+		return fmt.Errorf("rotate close: %w", err)
+	}
 
 	w.epoch++
 	w.seq = 0
-	next := getSegmentPath(w.epoch)
-	f, err := os.OpenFile(next, os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(getSegmentPath(w.epoch), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return err
+		return fmt.Errorf("rotate open next segment: %w", err)
 	}
 	w.currentFile = f
 	return nil
@@ -118,12 +122,14 @@ func (w *WAL) rotate() error {
 // which means it doesn't matter what records comes before
 // that state is the consequence of all the records before it
 func (w *WAL) Checkpoint(sm StateMachine) error {
-	// create snapshot + checkpoint marker in WAL
-	snapPath := fmt.Sprintf("snapshot/%d-%d.snap", w.epoch, w.seq)
+	cpEpoch := w.epoch
+	cpSeq := w.seq
+
+	snapPath := getSnapshotPath(cpEpoch, cpSeq)
 	tmpPath := snapPath + ".tmp"
 
+	// Phase 1: write snapshot file.
 	f, err := os.Create(tmpPath)
-
 	if err != nil {
 		return fmt.Errorf("snapshot create: %w", err)
 	}
@@ -135,7 +141,6 @@ func (w *WAL) Checkpoint(sm StateMachine) error {
 		os.Remove(tmpPath)
 		return fmt.Errorf("snapshot write: %w", err)
 	}
-
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
@@ -146,29 +151,36 @@ func (w *WAL) Checkpoint(sm StateMachine) error {
 	if err := os.Rename(tmpPath, snapPath); err != nil {
 		return fmt.Errorf("snapshot rename: %w", err)
 	}
+	if dir, err := os.Open(SNAPSHOTS_DIR); err == nil {
+		dir.Sync()
+		dir.Close()
+	}
 
-	dir, _ := os.Open("snapshot")
-	dir.Sync()
-	dir.Close()
-
+	// Phase 2: write checkpoint marker.
 	snapshotChecksum := xxhash.Sum64(data)
 
 	payload := make([]byte, 16)
-	binary.LittleEndian.PutUint32(payload[0:4], w.epoch)
-	binary.LittleEndian.PutUint32(payload[4:8], w.seq)
+	binary.LittleEndian.PutUint32(payload[0:4], cpEpoch)
+	binary.LittleEndian.PutUint32(payload[4:8], cpSeq)
 	binary.LittleEndian.PutUint64(payload[8:16], snapshotChecksum)
 
-	header := buildHeader(w.epoch, w.seq, TypeCheckpoint, payload)
+	w.seq++
+	fmt.Printf("writing checkpoint marker at header seq=%d cpSeq=%d\n", w.seq, cpSeq)
+	header := buildHeader(cpEpoch, w.seq, TypeCheckpoint, payload)
 	if _, err := w.currentFile.Write(append(header, payload...)); err != nil {
 		return fmt.Errorf("checkpoint WAL write: %w", err)
 	}
-	return w.compact(w.epoch)
+	if err := w.currentFile.Sync(); err != nil {
+		return fmt.Errorf("checkpoint WAL sync: %w", err)
+	}
+
+	return w.compact(cpEpoch)
 }
 
 func (w *WAL) compact(currentEpoch uint32) error {
-	segments, err := getSegments(".", ".log")
+	segments, err := getSegments(".")
 	if err != nil {
-		return fmt.Errorf("deleteSegmentsBefore: %w", err)
+		return fmt.Errorf("compact: %w", err)
 	}
 
 	for _, seg := range segments {
@@ -197,97 +209,82 @@ func buildHeader(epoch, seq uint32, recType byte, payload []byte) []byte {
 	return h
 }
 
-func (w *WAL) Start(sm StateMachine) {
-	// get length of files and create wal-{n + 1}.log, edge-case for 10, 11
-	epoch, err := getSegments(".", "log")
-	w.epoch = uint32(len(epoch))
-
+func (w *WAL) Start(sm StateMachine) error {
+	segments, err := getSegments(".")
 	if err != nil {
-		return
+		return fmt.Errorf("start: %w", err)
 	}
 
 	var currentFile *os.File
-	epochLen := len(epoch)
 
-	// create starting wal file or open file
-	if len(epoch) == 0 {
-		currentFile, err = os.Create(getSegmentPath(uint32(len(epoch) + 1)))
+	if len(segments) == 0 {
+		w.epoch = 1
+		w.seq = 0
+		currentFile, err = os.OpenFile(getSegmentPath(w.epoch), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
-			fmt.Printf("unable to create starting file: %v", err)
+			return fmt.Errorf("create first segment: %w", err)
 		}
-		// add 1 to epochLen - getSegments only runs on start up
-		epochLen++
 	} else {
-		currentFile, err = os.OpenFile(epoch[len(epoch)-1], os.O_APPEND|os.O_WRONLY, 0644)
+		w.epoch = uint32(len(segments))
+		currentFile, err = os.OpenFile(segments[len(segments)-1], os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("open segment: %w", err)
 		}
 	}
-	defer currentFile.Close()
+
+	w.currentFile = currentFile
+	defer w.currentFile.Close()
 
 	var pending []Request
 	var buffer []byte
 	ticker := time.NewTicker(5 * time.Millisecond)
-
-	w.currentFile = currentFile
+	defer ticker.Stop()
 
 	for {
 		select {
-		case data := <-w.writeCh:
-			pending = append(pending, data)
-			// [epoch][sequence][type][length][XXH3 checksum][payload]
-			payload := []byte(fmt.Sprintf("%s %s:%s", data.Record.Method, data.Record.Key, data.Record.Value))
+		case req := <-w.writeCh:
+			pending = append(pending, req)
+			payload := []byte(fmt.Sprintf("%s %s:%s", req.Record.Method, req.Record.Key, req.Record.Value))
+			fmt.Println(w.seq)
 			w.seq++
-
 			header := buildHeader(w.epoch, w.seq, TypeWrite, payload)
 			buffer = append(buffer, header...)
 			buffer = append(buffer, payload...)
+			sm.Apply(req.Record)
 		case <-ticker.C:
-			// checkpoint every 5ms - make sure to not recover records on database already
 			if len(buffer) == 0 {
 				continue
 			}
 
-			_, err := currentFile.Write(buffer)
-			currentFile.Sync()
+			// flush batch first - snapshot must reflect committed state
+			_, err := w.currentFile.Write(buffer)
+			w.currentFile.Sync()
 
-			// notify the waiters
-			for _, req := range pending {
-				req.Done <- err
-			}
-
-			pending = pending[:0]
-			buffer = buffer[:0]
-
-			if w.seq%100000 == 0 {
+			// checkpoint before rotate so marker lands in the current segment
+			if w.seq%w.snapshotCount == 0 {
+				fmt.Println("CHECKPOINT", w.seq)
 				w.Checkpoint(sm)
 			}
 
-			// if file size exceeds limit, rotate the wal
-			if err := w.rotate(); err != nil {
-				for _, req := range pending {
-					req.Done <- err
-				}
-				continue
+			for _, req := range pending {
+				req.Done <- err
 			}
+			pending = pending[:0]
+			buffer = buffer[:0]
 
+			w.rotate()
 		}
 	}
-
 }
 
-// func Apply(key, val string, method string) {
 func (w *WAL) Append(record Record) error {
-	done := make(chan error)
-	request := Request{Record: record, Done: done}
-
-	w.writeCh <- request
-
+	done := make(chan error, 1)
+	w.writeCh <- Request{Record: record, Done: done}
 	return <-done
 }
 
 func (w *WAL) Recover(sm StateMachine) error {
-	segments, err := getSegments(".", ".log")
+	segments, err := getSegments(".")
 	if err != nil {
 		return fmt.Errorf("recover: %w", err)
 	}
@@ -326,33 +323,43 @@ func (w *WAL) Recover(sm StateMachine) error {
 
 		computedChecksum := xxhash.Sum64(append(headerBuf[:13], payload...))
 		if computedChecksum != storedChecksum {
+			fmt.Printf("checksum mismatch at seq=%d type=%d\n", seq, recType)
 			break
 		}
 
+		fmt.Printf("reading record2: seq=%d expectedSeq=%d type=%d\n", seq, expectedSeq, recType)
 		if seq != expectedSeq {
 			break
 		}
 		expectedSeq++
 
+		fmt.Printf("reading record: seq=%d expectedSeq=%d type=%d\n", seq, expectedSeq, recType)
 		if recType == TypeCheckpoint {
+			fmt.Println("payload")
 			cpEpoch := binary.LittleEndian.Uint32(payload[0:4])
 			cpSeq := binary.LittleEndian.Uint32(payload[4:8])
 			storedSnapChecksum := binary.LittleEndian.Uint64(payload[8:16])
 
+			fmt.Println("reading file")
 			snapData, err := os.ReadFile(getSnapshotPath(cpEpoch, cpSeq))
+			fmt.Printf("snapData: %q\n", string(snapData))
 			if err != nil {
-				// snapshot missing, stop — can't trust state past this point
+				fmt.Printf("snapshot read error: %v\n", err)
 				break
 			}
-			if xxhash.Sum64(snapData) != storedSnapChecksum {
-				// snapshot corrupt, same fallback
+			fmt.Println("read")
+			computed := xxhash.Sum64(snapData)
+			if computed != storedSnapChecksum {
+				fmt.Printf("snapshot checksum mismatch: stored=%d computed=%d\n", storedSnapChecksum, computed)
 				break
 			}
+			fmt.Println("correct checksum")
 			if err := sm.Restore(snapData); err != nil {
 				return fmt.Errorf("restore snapshot (%d, %d): %w", cpEpoch, cpSeq, err)
 			}
+			fmt.Println("restore")
+			// fmt.Printf("state after restore: %v\n", sm.)
 
-			// everything before this is now covered by the snapshot
 			expectedSeq = seq + 1
 			continue
 		}
