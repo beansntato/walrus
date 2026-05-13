@@ -43,6 +43,15 @@ const (
 	TypeCheckpoint
 )
 
+const MAX_SEGMENT_SIZE = 64 * 1024 * 1024 // 64MB
+
+const HEADER_SIZE = 4 + // epoch
+	4 + // local seq
+	8 + // global seq
+	1 + // type
+	4 + // length
+	8 // xxh3 checksum
+
 func New() *WAL {
 	return &WAL{writeCh: make(chan Request), epoch: 0, seq: 0}
 }
@@ -78,10 +87,8 @@ func getEpoch(root string, ext string) ([]string, error) {
 	return files, nil
 }
 
-const MAX_SEGMENT_SIZE = 64 * 1024 * 1024 // 64MB
-
 // once the current wal file size exceeds the max size, create the next file TODO: add by line check, if exceeds 1M lines
-func (w *WAL) rotate() error {
+func (w *WAL) rotate(sm StateMachine) error {
 	info, err := w.currentFile.Stat()
 	if err != nil {
 		return err
@@ -96,6 +103,10 @@ func (w *WAL) rotate() error {
 	}
 	w.currentFile.Close()
 
+	if err := w.Checkpoint(sm); err != nil {
+		return fmt.Errorf("checkpoint on rotate: %w", err)
+	}
+
 	w.epoch++
 	w.seq = 0
 	next := getSegmentPath(w.epoch)
@@ -107,23 +118,56 @@ func (w *WAL) rotate() error {
 	return nil
 }
 
-func (w *WAL) checkpoint() {
-	// check if WAL has 1000 lines -> Recover()
+// this creates a snapshot to avoid having to replay all lines of a WAL file
+// the snapshot contains the state of the StateMachine at that point in time
+// which means it doesn't matter what records comes before
+// that state is the consequence of all the records before it
+func (w *WAL) Checkpoint(sm StateMachine) error {
+	// create snapshot + checkpoint marker in WAL
+	snapPath := fmt.Sprintf("snapshot/%d.snap", w.globalSeq)
+	tmpPath := snapPath + ".tmp"
 
-	// // initialize the new wal file wal-{n}.log - n = no. of files with wal- prefix and .log extension
-	// currentFile, err = os.Create(fmt.Sprintf("wal-%d.log", epochLen+1))
-	// if err != nil {
-	// 	fmt.Printf("unable to create starting file: %w", err)
-	// }
-	// epochLen++
+	f, err := os.Create(tmpPath)
+
+	if err != nil {
+		return fmt.Errorf("snapshot create: %w", err)
+	}
+
+	data := sm.Snapshot()
+
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("snapshot write: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("snapshot sync: %w", err)
+	}
+	f.Close()
+
+	if err := os.Rename(tmpPath, snapPath); err != nil {
+		return fmt.Errorf("snapshot rename: %w", err)
+	}
+
+	dir, _ := os.Open("snapshot")
+	dir.Sync()
+	dir.Close()
+
+	hash := xxhash.Sum64(data)
+
+	payload := make([]byte, 16)
+	binary.LittleEndian.PutUint64(payload[0:16], w.globalSeq)
+	binary.LittleEndian.PutUint64(payload[16:32], hash)
+
+	header := buildHeader(w.epoch, w.seq, w.globalSeq, TypeCheckpoint, payload)
+	if _, err := w.currentFile.Write(append(header, payload...)); err != nil {
+		return fmt.Errorf("checkpoint WAL write: %w", err)
+	}
+	return w.currentFile.Sync()
 }
-
-const HEADER_SIZE = 4 + // epoch
-	4 + // local seq
-	8 + // global seq
-	1 + // type
-	4 + // length
-	8 // xxh3 checksum
 
 func buildHeader(epoch uint32, seq uint32, globalSeq uint64, recType byte, payload []byte) []byte {
 	h := make([]byte, HEADER_SIZE)
@@ -139,7 +183,7 @@ func buildHeader(epoch uint32, seq uint32, globalSeq uint64, recType byte, paylo
 	return h
 }
 
-func (w *WAL) Start() {
+func (w *WAL) Start(sm StateMachine) {
 	// get length of files and create wal-{n + 1}.log, edge-case for 10, 11
 	epoch, err := getEpoch(".", "log")
 	w.epoch = uint32(len(epoch))
@@ -179,6 +223,7 @@ func (w *WAL) Start() {
 			pending = append(pending, data)
 			// [epoch][sequence][type][length][XXH3 checksum][payload]
 			payload := []byte(fmt.Sprintf("%s %s:%s", data.Record.Method, data.Record.Key, data.Record.Value))
+			w.globalSeq++
 			w.seq++
 
 			header := buildHeader(w.epoch, w.seq, w.globalSeq, TypeWrite, payload)
