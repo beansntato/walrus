@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"beansnbeans.dev/wal"
+	"beansntato.dev/wal"
 )
 
 func main() {

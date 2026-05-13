@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"beansnbeans.dev/wal"
+	"beansntato.dev/wal"
 )
 
 type KV struct {

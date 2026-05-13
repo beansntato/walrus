@@ -1,4 +1,4 @@
-module beansnbeans.dev/wal
+module beansntato.dev/wal
 
 go 1.26.2
 
