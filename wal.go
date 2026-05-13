@@ -23,7 +23,6 @@ type WAL struct {
 	writeCh     chan Request
 	seq         uint32
 	epoch       uint32
-	globalSeq   uint64
 	currentFile *os.File
 }
 
@@ -47,7 +46,6 @@ const MAX_SEGMENT_SIZE = 64 * 1024 * 1024 // 64MB
 
 const HEADER_SIZE = 4 + // epoch
 	4 + // local seq
-	8 + // global seq
 	1 + // type
 	4 + // length
 	8 // xxh3 checksum
@@ -56,7 +54,7 @@ func New() *WAL {
 	return &WAL{writeCh: make(chan Request), epoch: 0, seq: 0}
 }
 
-func getEpoch(root string, ext string) ([]string, error) {
+func getSegments(root string, ext string) ([]string, error) {
 	var files []string
 
 	f, err := os.Open(root)
@@ -87,8 +85,9 @@ func getEpoch(root string, ext string) ([]string, error) {
 	return files, nil
 }
 
-// once the current wal file size exceeds the max size, create the next file TODO: add by line check, if exceeds 1M lines
-func (w *WAL) rotate(sm StateMachine) error {
+// once the current wal file size exceeds the max size,
+// create the next file. this is used to manage the file size of the logs
+func (w *WAL) rotate() error {
 	info, err := w.currentFile.Stat()
 	if err != nil {
 		return err
@@ -102,10 +101,6 @@ func (w *WAL) rotate(sm StateMachine) error {
 		return err
 	}
 	w.currentFile.Close()
-
-	if err := w.Checkpoint(sm); err != nil {
-		return fmt.Errorf("checkpoint on rotate: %w", err)
-	}
 
 	w.epoch++
 	w.seq = 0
@@ -124,7 +119,7 @@ func (w *WAL) rotate(sm StateMachine) error {
 // that state is the consequence of all the records before it
 func (w *WAL) Checkpoint(sm StateMachine) error {
 	// create snapshot + checkpoint marker in WAL
-	snapPath := fmt.Sprintf("snapshot/%d.snap", w.globalSeq)
+	snapPath := fmt.Sprintf("snapshot/%d-%d.snap", w.epoch, w.seq)
 	tmpPath := snapPath + ".tmp"
 
 	f, err := os.Create(tmpPath)
@@ -156,36 +151,55 @@ func (w *WAL) Checkpoint(sm StateMachine) error {
 	dir.Sync()
 	dir.Close()
 
-	hash := xxhash.Sum64(data)
+	snapshotChecksum := xxhash.Sum64(data)
 
 	payload := make([]byte, 16)
-	binary.LittleEndian.PutUint64(payload[0:16], w.globalSeq)
-	binary.LittleEndian.PutUint64(payload[16:32], hash)
+	binary.LittleEndian.PutUint32(payload[0:4], w.epoch)
+	binary.LittleEndian.PutUint32(payload[4:8], w.seq)
+	binary.LittleEndian.PutUint64(payload[8:16], snapshotChecksum)
 
-	header := buildHeader(w.epoch, w.seq, w.globalSeq, TypeCheckpoint, payload)
+	header := buildHeader(w.epoch, w.seq, TypeCheckpoint, payload)
 	if _, err := w.currentFile.Write(append(header, payload...)); err != nil {
 		return fmt.Errorf("checkpoint WAL write: %w", err)
 	}
-	return w.currentFile.Sync()
+	return w.compact(w.epoch)
 }
 
-func buildHeader(epoch uint32, seq uint32, globalSeq uint64, recType byte, payload []byte) []byte {
+func (w *WAL) compact(currentEpoch uint32) error {
+	segments, err := getSegments(".", ".log")
+	if err != nil {
+		return fmt.Errorf("deleteSegmentsBefore: %w", err)
+	}
+
+	for _, seg := range segments {
+		var epoch uint32
+		if _, err := fmt.Sscanf(seg, "wal-%d.log", &epoch); err != nil {
+			continue
+		}
+		if epoch < currentEpoch {
+			if err := os.Remove(seg); err != nil {
+				return fmt.Errorf("delete segment %s: %w", seg, err)
+			}
+		}
+	}
+	return nil
+}
+
+func buildHeader(epoch, seq uint32, recType byte, payload []byte) []byte {
 	h := make([]byte, HEADER_SIZE)
 	binary.LittleEndian.PutUint32(h[0:4], epoch)
 	binary.LittleEndian.PutUint32(h[4:8], seq)
-	binary.LittleEndian.PutUint64(h[8:16], globalSeq)
-	h[16] = recType
-	binary.LittleEndian.PutUint32(h[17:21], uint32(len(payload)))
+	h[8] = recType
+	binary.LittleEndian.PutUint32(h[9:13], uint32(len(payload)))
 
-	// checksum
-	checksum := xxhash.Sum64(append(h[:21], payload...))
-	binary.LittleEndian.PutUint64(h[21:29], checksum)
+	checksum := xxhash.Sum64(append(h[:13], payload...))
+	binary.LittleEndian.PutUint64(h[13:21], checksum)
 	return h
 }
 
 func (w *WAL) Start(sm StateMachine) {
 	// get length of files and create wal-{n + 1}.log, edge-case for 10, 11
-	epoch, err := getEpoch(".", "log")
+	epoch, err := getSegments(".", "log")
 	w.epoch = uint32(len(epoch))
 
 	if err != nil {
@@ -201,7 +215,7 @@ func (w *WAL) Start(sm StateMachine) {
 		if err != nil {
 			fmt.Printf("unable to create starting file: %v", err)
 		}
-		// add 1 to epochLen - getEpoch only runs on start up
+		// add 1 to epochLen - getSegments only runs on start up
 		epochLen++
 	} else {
 		currentFile, err = os.OpenFile(epoch[len(epoch)-1], os.O_APPEND|os.O_WRONLY, 0644)
@@ -223,26 +237,14 @@ func (w *WAL) Start(sm StateMachine) {
 			pending = append(pending, data)
 			// [epoch][sequence][type][length][XXH3 checksum][payload]
 			payload := []byte(fmt.Sprintf("%s %s:%s", data.Record.Method, data.Record.Key, data.Record.Value))
-			w.globalSeq++
 			w.seq++
 
-			header := buildHeader(w.epoch, w.seq, w.globalSeq, TypeWrite, payload)
+			header := buildHeader(w.epoch, w.seq, TypeWrite, payload)
 			buffer = append(buffer, header...)
 			buffer = append(buffer, payload...)
 		case <-ticker.C:
 			// checkpoint every 5ms - make sure to not recover records on database already
 			if len(buffer) == 0 {
-				continue
-			}
-
-			// if file size exceeds limit, rotate the wal
-			if err := w.rotate(); err != nil {
-				for _, req := range pending {
-					req.Done <- err
-				}
-
-				pending = pending[:0]
-				buffer = buffer[:0]
 				continue
 			}
 
@@ -256,6 +258,18 @@ func (w *WAL) Start(sm StateMachine) {
 
 			pending = pending[:0]
 			buffer = buffer[:0]
+
+			if w.seq%100000 == 0 {
+				w.Checkpoint(sm)
+			}
+
+			// if file size exceeds limit, rotate the wal
+			if err := w.rotate(); err != nil {
+				for _, req := range pending {
+					req.Done <- err
+				}
+				continue
+			}
 
 		}
 	}
@@ -276,58 +290,44 @@ func (w *WAL) Append(record Record) error {
 }
 
 func (w *WAL) Recover(sm StateMachine) error {
-	epoch, err := getEpoch(".", "log")
-	w.epoch = uint32(len(epoch))
-
+	segments, err := getSegments(".", ".log")
 	if err != nil {
-		return err
+		return fmt.Errorf("recover: %w", err)
 	}
 
-	// create starting wal file or open file
-	if len(epoch) == 0 {
-		// stop recover since no wal files yet
+	if len(segments) == 0 {
 		return nil
 	}
 
-	currentFile, err := os.Open(epoch[len(epoch)-1])
-	fmt.Println(epoch[len(epoch)-1])
+	w.epoch = uint32(len(segments))
 
+	currentFile, err := os.Open(segments[len(segments)-1])
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("recover open segment: %w", err)
 	}
 	defer currentFile.Close()
-
-	fmt.Println(currentFile)
-
-	var records []Record
 
 	var expectedSeq uint32 = 1
 
 	for {
 		headerBuf := make([]byte, HEADER_SIZE)
-		_, err := io.ReadFull(currentFile, headerBuf)
-		if err == io.EOF {
+		if _, err := io.ReadFull(currentFile, headerBuf); err == io.EOF {
+			break
+		} else if err != nil {
 			break
 		}
-		if err != nil {
-			// corrupted header
-			break
-		}
+
 		seq := binary.LittleEndian.Uint32(headerBuf[4:8])
 		recType := headerBuf[8]
-		length := binary.LittleEndian.Uint16(headerBuf[9:11])
-		storedChecksum := binary.LittleEndian.Uint64(headerBuf[11:HEADER_SIZE])
+		length := binary.LittleEndian.Uint32(headerBuf[9:13])
+		storedChecksum := binary.LittleEndian.Uint64(headerBuf[13:HEADER_SIZE])
 
 		payload := make([]byte, length)
-		_, err = io.ReadFull(currentFile, payload)
-
-		if err != nil {
-			// corrupted payload
+		if _, err := io.ReadFull(currentFile, payload); err != nil {
 			break
 		}
 
-		// compare and verify the checksum
-		computedChecksum := xxhash.Sum64(append(headerBuf[:11], payload...))
+		computedChecksum := xxhash.Sum64(append(headerBuf[:13], payload...))
 		if computedChecksum != storedChecksum {
 			break
 		}
@@ -337,15 +337,38 @@ func (w *WAL) Recover(sm StateMachine) error {
 		}
 		expectedSeq++
 
-		// only apply write records
+		if recType == TypeCheckpoint {
+			cpEpoch := binary.LittleEndian.Uint32(payload[0:4])
+			cpSeq := binary.LittleEndian.Uint32(payload[4:8])
+			storedSnapChecksum := binary.LittleEndian.Uint64(payload[8:16])
+
+			snapData, err := os.ReadFile(fmt.Sprintf("snapshot/%d-%d.snap", cpEpoch, cpSeq))
+			if err != nil {
+				// snapshot missing, stop — can't trust state past this point
+				break
+			}
+			if xxhash.Sum64(snapData) != storedSnapChecksum {
+				// snapshot corrupt, same fallback
+				break
+			}
+			if err := sm.Restore(snapData); err != nil {
+				return fmt.Errorf("restore snapshot (%d, %d): %w", cpEpoch, cpSeq, err)
+			}
+
+			// everything before this is now covered by the snapshot
+			expectedSeq = seq + 1
+			continue
+		}
+
 		if recType != TypeWrite {
 			continue
 		}
 
 		parts := strings.SplitN(string(payload), " ", 2)
-
+		if len(parts) < 2 {
+			break
+		}
 		method := parts[0]
-
 		keyValue := strings.SplitN(parts[1], ":", 2)
 
 		record := Record{
@@ -356,10 +379,7 @@ func (w *WAL) Recover(sm StateMachine) error {
 			record.Value = keyValue[1]
 		}
 
-		records = append(records, record)
-
-		err = sm.Apply(record)
-		if err != nil {
+		if err := sm.Apply(record); err != nil {
 			return err
 		}
 	}
