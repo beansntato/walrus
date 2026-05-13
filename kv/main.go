@@ -2,92 +2,24 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"os"
 
 	"beansnbeans.dev/wal"
 )
 
-type methodType int
-
-const (
-	PUT methodType = iota
-	DELETE
-)
-
-var methodName = map[methodType]string{
-	PUT:    "PUT",
-	DELETE: "DELETE",
-}
-
-type KV struct {
-	data map[string]string
-	wal  *wal.WAL
-}
-
 func main() {
-	wal := wal.New()
-	kv := &KV{data: make(map[string]string), wal: wal}
-	wal.Recover(kv)
+	os.MkdirAll("snapshot", 0755)
 
-	go wal.Start()
+	sm := NewKV()
+	w := wal.New()
 
-	kv.Put("b", "2")
-	kv.Delete("b")
-	kv.Put("a", "2")
-	kv.print()
+	if err := w.Recover(sm); err != nil {
+		log.Fatal(err)
+	}
+
+	go w.Start(sm)
+
+	w.Append(wal.Record{Method: "PUT", Key: "foo", Value: "bar"})
+	fmt.Println(sm.Get("foo"))
 }
-
-func (kv *KV) print() {
-	fmt.Println("kv data")
-	for i, v := range kv.data {
-		fmt.Println(i, " - ", v)
-	}
-}
-
-func (kv *KV) Put(key, value string) error {
-	record := wal.Record{
-		Key:    key,
-		Value:  value,
-		Method: methodName[PUT],
-	}
-
-	fmt.Println("running")
-	err := kv.wal.Append(record)
-	fmt.Println("err", err)
-	if err != nil {
-		return err
-	}
-
-	kv.Apply(record)
-	return nil
-}
-
-func (kv *KV) Delete(key string) error {
-	record := wal.Record{
-		Key:    key,
-		Method: methodName[DELETE],
-	}
-
-	err := kv.wal.Append(record)
-	if err != nil {
-		return err
-	}
-
-	return kv.Apply(record)
-}
-
-func (kv *KV) Apply(record wal.Record) error {
-	switch record.Method {
-	case "PUT":
-		kv.data[record.Key] = record.Value
-	case "DELETE":
-		delete(kv.data, record.Key)
-	default:
-		fmt.Println("Working in progress on this method bruh")
-	}
-
-	return nil
-}
-
-func (k *KV) Snapshot() {}
-
-func (k *KV) Restore() {}
