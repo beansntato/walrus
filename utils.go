@@ -11,6 +11,11 @@ func getSegmentPath(epoch uint32) string {
 	return fmt.Sprintf("wal-%06d.log", epoch)
 }
 
+func getSnapshotPath(epoch, seq uint32) string {
+	return fmt.Sprintf("%s/%d-%d.snap", SNAPSHOTS_DIR, epoch, seq)
+
+}
+
 func naturalCmp(a, b string) int {
 	// tokenizer solution for natural sort lol
 	for len(a) > 0 && len(b) > 0 {

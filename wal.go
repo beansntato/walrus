@@ -281,10 +281,7 @@ func (w *WAL) Append(record Record) error {
 	done := make(chan error)
 	request := Request{Record: record, Done: done}
 
-	fmt.Println("adding request")
 	w.writeCh <- request
-
-	fmt.Println("done")
 
 	return <-done
 }
@@ -342,7 +339,7 @@ func (w *WAL) Recover(sm StateMachine) error {
 			cpSeq := binary.LittleEndian.Uint32(payload[4:8])
 			storedSnapChecksum := binary.LittleEndian.Uint64(payload[8:16])
 
-			snapData, err := os.ReadFile(fmt.Sprintf("snapshot/%d-%d.snap", cpEpoch, cpSeq))
+			snapData, err := os.ReadFile(getSnapshotPath(cpEpoch, cpSeq))
 			if err != nil {
 				// snapshot missing, stop — can't trust state past this point
 				break
